@@ -50,7 +50,9 @@ public static class UiAutomationDriver
 
     /// <summary>Deep single-node inspection: identity, provider state, and the DataContext's reflectable
     /// command/property members (the surface the Phase-7 reflection actions target).</summary>
-    public static UiNodeDetail Inspect(Control control, string path)
+    /// <param name="root">The window <paramref name="path"/> was resolved against. With it, a control whose
+    /// DataContext is inherited names the control that owns it instead of repeating its members.</param>
+    public static UiNodeDetail Inspect(Control control, string path, Control? root = null)
     {
         var peer = ControlAutomationPeer.CreatePeerForElement(control);
         var providers = DescribeProviders(peer, control);
@@ -78,6 +80,23 @@ public static class UiAutomationDriver
 
         var rect = Safe(() => peer.GetBoundingRectangle(), default(Rect));
 
+        // Members are listed where the DataContext is set, not on every control that inherits it. A scroll bar
+        // inside a code window used to report the whole CodeEditorViewModel, source file included, ahead of
+        // the range the caller asked about (#562).
+        var owner = root is null ? control : DataContextOwner(control, root);
+        var ownerPath = root is not null && !ReferenceEquals(owner, control)
+            ? PathWithin(root, "Window", owner)
+            : null;
+        var (members, omitted) = ownerPath is null ? DescribeDataContext(control.DataContext) : ([], 0);
+        string? note = null;
+        if (ownerPath is not null)
+            note = $"This control inherits its DataContext ({control.DataContext!.GetType().Name}) from {ownerPath}; "
+                 + "inspect that path for its members. invoke_command and set_property on this control act on "
+                 + "the same object.";
+        else if (omitted > 0)
+            note = $"{omitted} member(s) declared by the Dock framework's base types (layout plumbing such as "
+                 + "Proportion and CanFloat) are not listed; set_property still reaches them by name.";
+
         return new UiNodeDetail(
             path,
             ControlTypeOf(peer),
@@ -94,25 +113,69 @@ public static class UiAutomationDriver
             selection,
             value,
             toggle,
-            ReflectDataContextMembers(control.DataContext),
-            range);
+            members,
+            range,
+            ownerPath,
+            note);
+    }
+
+    /// <summary>
+    /// The outermost control, counting only those the control view shows, that shares
+    /// <paramref name="control"/>'s DataContext: where that DataContext is set, as far as a caller can address.
+    /// </summary>
+    /// <remarks>
+    /// Compared against meaningful ancestors only. A view built from a DataTemplate inherits its DataContext
+    /// from a ContentPresenter, which the control view folds away, so against the raw visual parent nearly
+    /// every view would read as inheriting. The walk stops at <paramref name="root"/>, because a path cannot
+    /// name anything above it; Avalonia 12 puts a TopLevelHost above the window, sharing its DataContext.
+    /// </remarks>
+    private static Control DataContextOwner(Control control, Control root)
+    {
+        var dataContext = control.DataContext;
+        var owner = control;
+        if (dataContext is null || ReferenceEquals(control, root)) return owner;
+        for (var a = control.GetVisualParent(); a is not null; a = a.GetVisualParent())
+        {
+            if (a is not Control c || Classify(c).Structural) continue;
+            if (!ReferenceEquals(c.DataContext, dataContext)) break;
+            owner = c;
+            if (ReferenceEquals(c, root)) break;
+        }
+        return owner;
     }
 
     /// <summary>Reflects the public instance command/property members of a control's DataContext.</summary>
-    public static VmMember[] ReflectDataContextMembers(object? dataContext)
+    public static VmMember[] ReflectDataContextMembers(object? dataContext) => DescribeDataContext(dataContext).Members;
+
+    /// <summary>
+    /// The members <see cref="ReflectDataContextMembers"/> lists, and how many it left out because the Dock
+    /// framework's base types declare them.
+    /// </summary>
+    /// <remarks>
+    /// A document or tool view model derives from Dock's, which adds about fifty layout members (MdiBounds,
+    /// Proportion, AllowedDropOperations, ...). They say nothing about the view model's own surface, and they
+    /// buried it: 73 members for a code window, of which the caller wanted none (#562).
+    /// </remarks>
+    public static (VmMember[] Members, int OmittedDockMembers) DescribeDataContext(object? dataContext)
     {
-        if (dataContext is null) return [];
+        if (dataContext is null) return ([], 0);
         var members = new List<VmMember>();
+        var omitted = 0;
         foreach (var p in dataContext.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
         {
             if (p.GetIndexParameters().Length > 0) continue;
+            if (p.DeclaringType?.Namespace is { } ns && (ns == "Dock" || ns.StartsWith("Dock.", StringComparison.Ordinal)))
+            {
+                omitted++;
+                continue;
+            }
             if (typeof(System.Windows.Input.ICommand).IsAssignableFrom(p.PropertyType))
                 members.Add(new VmMember(p.Name, "command", null, false));
             else
                 members.Add(new VmMember(p.Name, "property", p.PropertyType.Name, p.CanWrite,
                                          ReadValue(dataContext, p)));
         }
-        return [.. members];
+        return ([.. members], omitted);
     }
 
 
@@ -144,6 +207,18 @@ public static class UiAutomationDriver
     {
         if (!p.CanRead) return null;
 
+        // An editor's document is a project file, which get_file_content already returns, open edits included.
+        // Rendering it here put a whole source file into every inspection of the editor (#562). The Immediate
+        // window's document is not a file and has no other reader, so it is still rendered below.
+        if (dataContext is HexIDE.Forms.ViewModels.ISearchableDocument searchable
+            && p.Name == nameof(HexIDE.Forms.ViewModels.ISearchableDocument.Document))
+            return Safe(() =>
+            {
+                var lines = searchable.Document.LineCount;
+                return $"<{lines} line{(lines == 1 ? "" : "s")} as the editor holds them, unsaved edits included; "
+                       + "read the text with get_file_content>";
+            }, null);
+
         var t = Nullable.GetUnderlyingType(p.PropertyType) ?? p.PropertyType;
         var readable = t == typeof(string) || t.IsEnum || t.IsPrimitive
                     || t == typeof(decimal) || t == typeof(DateTime) || t == typeof(DateTimeOffset)
@@ -162,9 +237,70 @@ public static class UiAutomationDriver
                 _ => raw.ToString(),
             };
             return text is { Length: > MaxValueLength }
-                ? text[..MaxValueLength] + $"… [truncated at {MaxValueLength} chars]"
+                ? text[..MaxValueLength] + $"… [truncated at {MaxValueLength} of {text.Length} chars]"
                 : text;
         }, null);
+    }
+
+    /// <summary>
+    /// For a text box whose text is bound, pushes the text to its source, as Enter or leaving the box would, and
+    /// says what came of it; null when there is nothing to commit.
+    /// </summary>
+    /// <remarks>
+    /// A box bound with <c>UpdateSourceTrigger=LostFocus</c> -- every Properties window row -- took the text and
+    /// changed nothing, and the reply said it had been set (#625). Whether the source KEPT the value is a separate
+    /// question, answered by <see cref="RefusedCommit"/> once the source's own reaction has run.
+    /// </remarks>
+    private static string? CommitTyped(Control control, string typed)
+    {
+        if (control is not TextBox textBox
+            || Avalonia.Data.BindingOperations.GetBindingExpressionBase(textBox, TextBox.TextProperty) is not { } binding)
+            return null;
+
+        binding.UpdateSource();
+        return CommittedSuffix;
+    }
+
+    private const string CommittedSuffix = ", and committed it";
+
+    /// <summary>
+    /// <paramref name="outcome"/> of a <c>set_value</c> that committed, with <paramref name="refusal"/> (from
+    /// <see cref="RefusedCommit"/>) in place of its claim that the value was committed.
+    /// </summary>
+    /// <remarks>
+    /// The sentence being replaced is written in this file, so it is replaced here too. The interact tool used to
+    /// match its text to decide whether to check at all, and a rewording would have stopped the check without a
+    /// sound (#634); it now asks <see cref="InteractOutcome.Committed"/> instead.
+    /// </remarks>
+    public static InteractOutcome WithRefusal(InteractOutcome outcome, string refusal) =>
+        outcome with
+        {
+            Detail = outcome.Detail is { } detail && detail.EndsWith(CommittedSuffix, StringComparison.Ordinal)
+                ? detail[..^CommittedSuffix.Length] + refusal
+                : outcome.Detail + refusal,
+        };
+
+    /// <summary>
+    /// After <c>set_value</c> committed <paramref name="typed"/> into a bound text box, what to say instead of
+    /// "committed it" when the box no longer shows it; null when it does.
+    /// </summary>
+    /// <remarks>
+    /// Asked after the dispatcher has run what the commit queued. A source that refuses a value puts its own
+    /// back from a posted callback, because a change raised while the binding is writing is not carried to the
+    /// box; asked straight after the write, a refused value still reads as accepted. Measured: the Properties
+    /// window's Name row, given "1st", opened its refusal and kept showing "1st".
+    /// </remarks>
+    public static string? RefusedCommit(Control control, string typed)
+    {
+        if (control is not TextBox textBox
+            || Avalonia.Data.BindingOperations.GetBindingExpressionBase(textBox, TextBox.TextProperty) is null)
+            return null;
+
+        var shown = textBox.Text ?? "";
+        return shown == typed
+            ? null
+            : $", but after committing it shows '{shown}': the change was refused or rewritten. A refusal opens a "
+              + "message box saying why, which dump_visual_tree shows.";
     }
 
     /// <summary>
@@ -173,8 +309,8 @@ public static class UiAutomationDriver
     /// </summary>
     public static readonly IReadOnlyList<string> Verbs =
     [
-        "invoke", "select", "double_click", "set_value", "set_range_value", "toggle", "expand", "collapse",
-        "scroll", "invoke_command", "set_property",
+        "invoke", "select", "add_to_selection", "remove_from_selection", "double_click", "set_value",
+        "set_range_value", "toggle", "expand", "collapse", "scroll", "invoke_command", "set_property",
     ];
 
     /// <summary>
@@ -187,6 +323,7 @@ public static class UiAutomationDriver
         ["invoke"] = ["invoke"],
         ["selection"] = ["select"],
         ["selectionItem"] = ["select"],
+        ["multiSelectItem"] = ["add_to_selection", "remove_from_selection"],
         ["value"] = ["set_value"],
         ["toggle"] = ["toggle"],
         ["expandCollapse"] = ["expand", "collapse"],
@@ -206,6 +343,9 @@ public static class UiAutomationDriver
         if (peer.GetProvider<IInvokeProvider>() is not null) list.Add("invoke");
         if (peer.GetProvider<ISelectionProvider>() is not null) list.Add("selection");
         if (peer.GetProvider<ISelectionItemProvider>() is not null) list.Add("selectionItem");
+        // Only in a list that holds several at once: in any other, adding to the selection would replace it,
+        // which is select under another name. (#661)
+        if (control is not null && Safe(() => MultiSelectOwner(control) is not null, false)) list.Add("multiSelectItem");
         if (peer.GetProvider<IValueProvider>() is not null) list.Add("value");
         if (peer.GetProvider<IToggleProvider>() is not null) list.Add("toggle");
         if (peer.GetProvider<IExpandCollapseProvider>() is not null) list.Add("expandCollapse");
@@ -275,10 +415,14 @@ public static class UiAutomationDriver
             switch (norm)
             {
                 case "invoke":
+                    // Named BEFORE the invoke. A button that closes its dialog is detached by the time the
+                    // invoke returns, its styles go with it, and its name falls back to the raw caption:
+                    // the New Project dialog's Open reported itself as '_Open' (#578).
+                    var invoked = LabelOf(control, peer);
                     if (peer.GetProvider<IInvokeProvider>() is { } inv)
                     {
                         inv.Invoke();
-                        return Ok($"invoked {ControlTypeOf(peer)} '{LabelOf(control, peer)}'");
+                        return Ok($"invoked {ControlTypeOf(peer)} '{invoked}'");
                     }
                     // MenuItemAutomationPeer exposes NO providers at all — not invoke, not
                     // expandCollapse — so every verb failed on a menu and none of it was reachable.
@@ -287,7 +431,7 @@ public static class UiAutomationDriver
                     if (control is MenuItem clickItem)
                     {
                         clickItem.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(MenuItem.ClickEvent));
-                        return Ok($"invoked MenuItem '{LabelOf(control, peer)}'");
+                        return Ok($"invoked MenuItem '{invoked}'");
                     }
                     return Unsupported("invoke");
 
@@ -361,10 +505,18 @@ public static class UiAutomationDriver
                     if (peer.GetProvider<IValueProvider>() is not { } val) return Unsupported("set_value");
                     if (value is null) return Err("set_value requires 'value'");
                     val.SetValue(value);
-                    return Ok($"set value of '{LabelOf(control, peer)}' to '{value}'");
+                    return CommitTyped(control, value) is { } committed
+                        ? Ok($"set value of '{LabelOf(control, peer)}' to '{value}'{committed}") with { Committed = true }
+                        : Ok($"set value of '{LabelOf(control, peer)}' to '{value}'");
 
                 case "select":
                     return DoSelect(control, peer, value);
+
+                case "addtoselection":
+                    return DoChangeSelection(control, peer, value, add: true);
+
+                case "removefromselection":
+                    return DoChangeSelection(control, peer, value, add: false);
 
                 case "doubleclick":
                     return DoDoubleClick(control, peer);
@@ -393,6 +545,60 @@ public static class UiAutomationDriver
         }
     }
 
+    /// <summary>
+    /// The list <paramref name="item"/> belongs to, when that list holds several selected items at once.
+    /// </summary>
+    private static ListBox? MultiSelectOwner(Control item) =>
+        ItemsControl.ItemsControlFromItemContainer(item) is ListBox owner
+        && owner.SelectionMode.HasFlag(SelectionMode.Multiple)
+        && owner.IndexFromContainer(item) >= 0
+            ? owner
+            : null;
+
+    /// <summary>
+    /// Adds the target to, or takes it out of, the selection of a list that holds several at once. <c>select</c>
+    /// replaces a selection, so without this the designer canvas could hold one control or, through Ctrl+A,
+    /// all of them, and the Format commands, which act on a chosen group, could not be aimed (#661).
+    /// </summary>
+    private static InteractOutcome DoChangeSelection(Control control, AutomationPeer peer, string? value, bool add)
+    {
+        var verb = add ? "add_to_selection" : "remove_from_selection";
+        if (NullIfEmpty(value) is not null)
+            return Err($"{verb} takes no value: target the item itself by its path from dump_visual_tree");
+        if (MultiSelectOwner(control) is not { } owner)
+            return peer.GetProvider<ISelectionItemProvider>() is not null
+                ? Err($"'{LabelOf(control, peer)}' is in a list that holds one selection at a time, so there is "
+                      + "nothing to add to; use select")
+                : Unsupported(verb);
+
+        var index = owner.IndexFromContainer(control);
+        var label = LabelOf(control, peer);
+        var was = owner.Selection.IsSelected(index);
+        if (add) owner.Selection.Select(index);
+        else owner.Selection.Deselect(index);
+
+        var change = add
+            ? was ? $"'{label}' was already selected" : $"added '{label}' to the selection"
+            : was ? $"removed '{label}' from the selection" : $"'{label}' was not selected";
+        return Ok($"{change}; {SelectionSummary(owner)}");
+    }
+
+    /// <summary>What a multi-select list now holds, by the names its rows carry in dump_visual_tree.</summary>
+    private static string SelectionSummary(ListBox owner)
+    {
+        var names = owner.Selection.SelectedIndexes
+            .Select(i => owner.ContainerFromIndex(i) is Control c
+                ? LabelOf(c, ControlAutomationPeer.CreatePeerForElement(c))
+                : owner.Items[i]?.ToString() ?? $"#{i}")
+            .ToList();
+        return names.Count switch
+        {
+            0 => "nothing is selected now",
+            1 => $"1 item is selected now: {names[0]}",
+            _ => $"{names.Count} items are selected now: {string.Join(", ", names)}",
+        };
+    }
+
     private static InteractOutcome DoSelect(Control control, AutomationPeer peer, string? value)
     {
         // value absent (treating "" as absent, like "omit if the target is the item") → select the target.
@@ -419,21 +625,66 @@ public static class UiAutomationDriver
             return Err($"'{LabelOf(control, peer)}' has no selectable items realized — if it's a dropdown, 'expand' it first, then dump_visual_tree to read the item text");
 
         var (matches, facet) = MatchByDiscriminator(candidates, value);
+        var broughtIntoView = false;
+        if (matches.Count == 0 && control is ListBox virtualized && virtualized.ItemCount > candidates.Count)
+        {
+            (matches, facet, broughtIntoView) = MatchAmongUnrealized(virtualized, value);
+            if (matches.Count == 0)
+                return Err($"no selectable item matching '{value}' among the {virtualized.ItemCount} item(s) in "
+                           + $"'{LabelOf(control, peer)}' — the ones not on screen were brought into view to check, and "
+                           + "the list was put back where it was; check the exact text via dump_visual_tree");
+        }
         if (matches.Count == 0)
             return Err($"no selectable item matching '{value}' among {candidates.Count} realized item(s) — check the exact text via dump_visual_tree");
         if (matches.Count > 1)
             return Err($"ambiguous select '{value}' ({matches.Count} {facet} matches); target the item directly by path instead");
 
+        var scrolled = broughtIntoView ? " (it was scrolled out of view, so the list was scrolled to it first)" : "";
         if (ControlAutomationPeer.CreatePeerForElement(matches[0]).GetProvider<ISelectionItemProvider>() is { } sip)
         {
             sip.Select();
-            return Ok($"selected '{value}'");
+            return Ok($"selected '{value}'{scrolled}");
         }
 
         if (TrySelectThroughOwningGrid(matches[0]) || TrySelectThroughOwningTree(matches[0]))
-            return Ok($"selected '{value}'");
+            return Ok($"selected '{value}'{scrolled}");
 
         return Unsupported("select");
+    }
+
+    /// <summary>
+    /// Brings a virtualizing list's items into view, a screenful at a time, until one matches
+    /// <paramref name="value"/>; if none does, puts the list back where it was.
+    /// </summary>
+    /// <remarks>
+    /// A list only creates rows for what is on screen, so a row scrolled out of view has no container, no
+    /// automation name, and nothing to match. The Properties window's <c>(Name)</c> row was out of reach this
+    /// way whenever the selected row had been scrolled into a short list, and the refusal counted only the
+    /// rows on screen, so it read as if the row did not exist (#627). A person scrolls to find a row; this
+    /// does the same. A row is identified by the automation name its container gets once realized, which is
+    /// what path addressing and <see cref="MatchByDiscriminator"/> use, so there is no second notion of what
+    /// an item is called.
+    /// </remarks>
+    private static (List<Control> Matches, string Facet, bool BroughtIntoView) MatchAmongUnrealized(
+        ListBox list, string value)
+    {
+        var scroller = list.Scroll as ScrollViewer;
+        var original = scroller?.Offset;
+        for (var index = 0; index < list.ItemCount; index++)
+        {
+            if (list.ContainerFromIndex(index) is not null) continue;
+            list.ScrollIntoView(index);
+            list.UpdateLayout();
+            var (matches, facet) = MatchByDiscriminator(SelectableCandidates(list), value);
+            if (matches.Count > 0) return (matches, facet, true);
+        }
+
+        if (scroller is not null && original is { } offset)
+        {
+            scroller.Offset = offset;
+            list.UpdateLayout();
+        }
+        return ([], "", false);
     }
 
     /// <summary>
@@ -879,13 +1130,24 @@ public static class UiAutomationDriver
     /// <summary>Types text into the resolved control (or its nearest text surface) by inserting at the
     /// caret via the control's own API — reliable and exact (no synthetic keystrokes, so live
     /// auto-indent/IntelliSense don't garble it). Multi-line text is inserted verbatim.</summary>
-    public static InteractOutcome TypeText(Control control, string text)
+    /// <remarks>
+    /// The insert is a document edit, not input, so it would go through a read-only editor that a person's
+    /// keystrokes could not change. It is refused there instead, and the mechanism is reported as
+    /// <see cref="TypedMechanism"/>: this used to say "keyboard", which is how a read-only gate that held was
+    /// taken for one that had failed (#649).
+    /// </remarks>
+    public static InteractOutcome TypeText(Control control, string text, string? controlPath = null)
     {
         try
         {
             if (FindTextSurface(control) is not { } surface)
-                return new InteractOutcome(false, "keyboard", null,
+                return new InteractOutcome(false, TypedMechanism, null,
                     $"'{control.GetType().Name}' has no text surface (TextEditor/TextArea/TextBox) to type into");
+
+            if (WhyNotTypable(surface) is { } refusal)
+                return new InteractOutcome(false, TypedMechanism, null,
+                    $"{surface.GetType().Name}{(ReferenceEquals(surface, control) ? string.Empty : AddressOf(control, controlPath, surface))} "
+                    + $"{refusal}, so a person could not type there either; nothing was inserted");
 
             surface.Focus();
             switch (surface)
@@ -906,15 +1168,32 @@ public static class UiAutomationDriver
                     box.CaretIndex = at + text.Length;
                     break;
             }
-            return new InteractOutcome(true, "keyboard", $"typed {text.Length} char(s) into {surface.GetType().Name}", null);
+            return new InteractOutcome(true, TypedMechanism,
+                $"typed {text.Length} char(s) into {surface.GetType().Name}{(ReferenceEquals(surface, control) ? string.Empty : AddressOf(control, controlPath, surface))}", null);
         }
-        catch (Exception ex) { return new InteractOutcome(false, "keyboard", null, $"type_text threw: {ex.Message}"); }
+        catch (Exception ex) { return new InteractOutcome(false, TypedMechanism, null, $"type_text threw: {ex.Message}"); }
+    }
+
+    /// <summary>What <see cref="TypeText"/> reports as its mechanism: an edit through the control's own API.</summary>
+    public const string TypedMechanism = "document";
+
+    /// <summary>Why a person could not type into <paramref name="surface"/> at its caret; null when they could.</summary>
+    private static string? WhyNotTypable(Control surface)
+    {
+        if (!surface.IsEffectivelyEnabled) return "is disabled";
+        return surface switch
+        {
+            TextEditor editor when !editor.TextArea.ReadOnlySectionProvider.CanInsert(editor.CaretOffset) => "is read-only",
+            TextArea area when !area.ReadOnlySectionProvider.CanInsert(area.Caret.Offset) => "is read-only",
+            TextBox { IsReadOnly: true } => "is read-only",
+            _ => null,
+        };
     }
 
     /// <summary>Presses a key (optionally with modifiers) on the resolved control by raising real
     /// KeyDown/KeyUp events — for navigation/commands (Enter, Tab, Backspace, Escape, Ctrl+S, …) that
     /// `type_text` doesn't cover.</summary>
-    public static InteractOutcome PressKey(Control control, string key, string? modifiers)
+    public static InteractOutcome PressKey(Control control, string key, string? modifiers, string? controlPath = null)
     {
         try
         {
@@ -937,7 +1216,9 @@ public static class UiAutomationDriver
             // nothing happens", and in each the answer was that the event went to a control other than the
             // one the caller meant — which the old reply had no way to say.
             var chord = mods == KeyModifiers.None ? string.Empty : mods + "+";
-            var where = ReferenceEquals(target, control) ? string.Empty : $" on {Describe(target)}";
+            var where = ReferenceEquals(target, control)
+                ? string.Empty
+                : $" on {Describe(target)}{AddressOf(control, controlPath, target)}";
             return new InteractOutcome(true, "keyboard", $"pressed {chord}{parsedKey}{where}", null);
         }
         catch (Exception ex) { return new InteractOutcome(false, "keyboard", null, $"press_key threw: {ex.Message}"); }
@@ -967,8 +1248,19 @@ public static class UiAutomationDriver
     /// caller waits.
     /// </para>
     /// </remarks>
-    public static InteractOutcome Hover(Control control, double? x, double? y)
+    public static InteractOutcome Hover(Control control, double? x, double? y) =>
+        Hover(control, x, y, null, out _);
+
+    /// <summary>Where a hover landed: the control the pointer events were raised on, and the point on it.</summary>
+    public readonly record struct HoverLanding(Control Receiver, Point Point);
+
+    /// <inheritdoc cref="Hover(Control, double?, double?)"/>
+    /// <param name="controlPath">The path <paramref name="control"/> was resolved from. When the pointer goes to
+    /// an editor under it, the reply gives that editor's path from this one.</param>
+    public static InteractOutcome Hover(
+        Control control, double? x, double? y, string? controlPath, out HoverLanding? landing)
     {
+        landing = null;
         try
         {
             if (TopLevel.GetTopLevel(control) is not { } topLevel)
@@ -992,11 +1284,43 @@ public static class UiAutomationDriver
                     (ulong)Environment.TickCount64, props, KeyModifiers.None));
             }
 
-            var where = ReferenceEquals(target, control) ? string.Empty : $" on {Describe(target)}";
+            landing = new HoverLanding(target, local);
+            var where = ReferenceEquals(target, control)
+                ? string.Empty
+                : $" on {Describe(target)}{AddressOf(control, controlPath, target)}";
             return new InteractOutcome(true, "pointer",
                 $"hovered ({local.X:0.#}, {local.Y:0.#}){where}", null);
         }
         catch (Exception ex) { return new InteractOutcome(false, "pointer", null, $"hover threw: {ex.Message}"); }
+    }
+
+    /// <summary>
+    /// The tooltip text declared for the point a hover landed on, open or not: the tip of the control under
+    /// that point, else of its nearest ancestor that has one. Null when none does.
+    /// </summary>
+    /// <remarks>
+    /// <b>Found from the point, never from the receiver's descendants.</b> Searching descendants reported
+    /// whichever control happened to come first in the tree: a hover on the window that landed in a code
+    /// editor answered with the Standard toolbar's "Add Project" (#610). The hit test still finds a tip
+    /// set on a part inside the receiver, because that part is what is under the point.
+    ///
+    /// <para>
+    /// <b>By bounds, not by Avalonia's hit test.</b> Both <c>InputHitTest</c> and <c>GetVisualAt</c> skip a
+    /// disabled button (measured in the headless tests, with <c>enabledElementsOnly: false</c> too), and a
+    /// disabled toolbar button is exactly where a caller asks what the tip says.
+    /// </para>
+    /// </remarks>
+    public static string? DeclaredToolTipAt(Control receiver, Point point)
+    {
+        Visual under = receiver;
+        while (under.GetVisualChildren().Where(v => v.IsEffectivelyVisible).Reverse()
+                   .FirstOrDefault(v => receiver.TranslatePoint(point, v) is { } p && new Rect(v.Bounds.Size).Contains(p))
+               is { } topmost)
+            under = topmost;
+
+        foreach (var c in under.GetSelfAndVisualAncestors().OfType<Control>())
+            if (ToolTip.GetTip(c)?.ToString() is { Length: > 0 } text) return text.Trim();
+        return null;
     }
 
     /// <summary>The element a hover should land on — the editor's text view, else the control itself.</summary>
@@ -1118,6 +1442,67 @@ public static class UiAutomationDriver
 
     // ── addressing ────────────────────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// ", at &lt;path&gt;" naming where <paramref name="receiver"/> sits, for a reply that went somewhere other
+    /// than the control addressed; empty when there is no path to give.
+    /// </summary>
+    /// <remarks>
+    /// A class name alone did not identify the receiver: the IDE holds a TextArea for the Immediate window and
+    /// one per open code editor, and a key pressed on a container went to whichever came first (#611). The
+    /// path is one <c>dump_visual_tree</c> would print, so it can be fed straight back as a target.
+    /// </remarks>
+    private static string AddressOf(Control addressed, string? addressedPath, Control receiver) =>
+        addressedPath is { Length: > 0 }
+        && AnchorOf(addressed, receiver) is { } anchor
+        && PathWithin(addressed, addressedPath, anchor) is { } path
+            ? $", at {path}"
+            : string.Empty;
+
+    /// <summary>
+    /// The control in <paramref name="addressed"/>'s tree to name for <paramref name="receiver"/>: the receiver
+    /// itself when it is there, else the TextEditor whose TextArea it is. FindKeyTarget reaches an editor's
+    /// TextArea through the property, and before the editor's template is applied that TextArea is in no tree.
+    /// </summary>
+    private static Control? AnchorOf(Control addressed, Control receiver)
+    {
+        if (ReferenceEquals(addressed, receiver) || IsUnder(addressed, receiver))
+            return receiver;
+        return addressed.GetVisualDescendants().OfType<TextEditor>()
+            .FirstOrDefault(e => ReferenceEquals(e.TextArea, receiver));
+    }
+
+    // Asked of the TARGET's ancestor chain, explicitly. `IsVisualAncestorOf` was tried here first and answered
+    // false for a window over a control inside it (measured in the headless tests), so it is not relied on.
+    private static bool IsUnder(Visual ancestor, Visual target) => target.GetVisualAncestors().Contains(ancestor);
+
+    /// <summary>
+    /// The control-view path of <paramref name="target"/>, walked down from <paramref name="from"/> (whose own
+    /// path is <paramref name="fromPath"/>) choosing each segment exactly as <c>dump_visual_tree</c> does, so it
+    /// round-trips through <see cref="Resolve"/>. A target the control view folds into a wrapper -- a TextArea
+    /// inside its TextEditor -- gets the path of its nearest addressable ancestor, which press_key and
+    /// type_text resolve back to the same receiver. Null when the target is not below <paramref name="from"/>.
+    /// </summary>
+    internal static string? PathWithin(Control from, string fromPath, Control target)
+    {
+        if (!ReferenceEquals(from, target) && !IsUnder(from, target))
+            return null;
+
+        var current = from;
+        var path = fromPath;
+        while (!ReferenceEquals(current, target))
+        {
+            var siblings = new List<MeaningfulChild>();
+            CollectMeaningfulChildren(current, siblings);
+            var next = siblings.FirstOrDefault(m =>
+                ReferenceEquals(m.Control, target) || IsUnder(m.Control, target));
+            if (next is null)
+                break;
+            path += "/" + BestSegment(next, siblings);
+            current = next.Control;
+        }
+        return path;
+    }
+
     /// <summary>Resolves a control-view slash path (rooted at <paramref name="root"/>, first segment
     /// "Window") to a single control, or an error explaining the miss / ambiguity.</summary>
     public static (Control? control, string? error) Resolve(Control root, string targetPath)
@@ -1191,7 +1576,7 @@ public static class UiAutomationDriver
         var byName = typed.Where(m => NameEquals(m.Control.Name, disc)).Select(m => m.Control).ToList();
         if (byName.Count > 0) return (byName, "name");
 
-        var byLabel = typed.Where(m => NameEquals(Safe<string?>(() => m.Info.Peer?.GetName(), null), disc))
+        var byLabel = typed.Where(m => NameEquals(MeaningfulLabelOf(m.Info.Peer), disc))
             .Select(m => m.Control).ToList();
         if (byLabel.Count > 0) return (byLabel, "label");
 
@@ -1267,7 +1652,8 @@ public static class UiAutomationDriver
             info.Peer is null || Safe(() => info.Peer.IsEnabled(), true),
             info.Peer is not null && Safe(() => info.Peer.IsOffscreen(), false),
             Hidden(node.Control),
-            children);
+            children,
+            TypeNameAsNameOf(info.Peer));
     }
 
 
@@ -1463,7 +1849,7 @@ public static class UiAutomationDriver
     {
         if (m.Info.AutoId is { } autoId) yield return autoId;
         if (NullIfEmpty(m.Control.Name) is { } xname) yield return xname;
-        if (NullIfEmpty(Safe<string?>(() => m.Info.Peer?.GetName(), null)) is { } label) yield return label;
+        if (MeaningfulLabelOf(m.Info.Peer) is { } label) yield return label;
     }
 
     private readonly record struct NodeClass(
@@ -1509,7 +1895,34 @@ public static class UiAutomationDriver
         => Safe(() => peer.GetAutomationControlType().ToString(), "Control");
 
     private static string? NameOf(Control control, AutomationPeer peer)
-        => NullIfEmpty(control.Name) ?? NullIfEmpty(Safe(() => peer.GetName(), string.Empty));
+        => NullIfEmpty(control.Name) ?? MeaningfulLabelOf(peer);
+
+    /// <summary>The peer's automation name, unless all it says is the .NET type of the control's content.</summary>
+    /// <remarks>
+    /// An icon button's peer names it by its content's <c>ToString()</c>, which for a Path is
+    /// "Avalonia.Controls.Shapes.Path" -- the same on every such button, so it neither describes the control nor
+    /// tells it from its siblings, and a path built on it cannot be trusted (#542). Such a name is dropped here,
+    /// so the path falls back to an index, and <see cref="TypeNameAsNameOf"/> reports what it was.
+    /// </remarks>
+    private static string? MeaningfulLabelOf(AutomationPeer? peer) =>
+        NullIfEmpty(Safe<string?>(() => peer?.GetName(), null)) is { } name && !IsTypeName(name) ? name : null;
+
+    /// <summary>The peer's automation name when <see cref="MeaningfulLabelOf"/> dropped it for being a type name.</summary>
+    private static string? TypeNameAsNameOf(AutomationPeer? peer) =>
+        NullIfEmpty(Safe<string?>(() => peer?.GetName(), null)) is { } name && IsTypeName(name) ? name : null;
+
+    private static readonly Dictionary<string, bool> s_typeNames = new(StringComparer.Ordinal);
+
+    /// <summary>True for a dotted name that resolves to a type in a loaded assembly.</summary>
+    private static bool IsTypeName(string name)
+    {
+        if (!name.Contains('.') || name.Contains(' ')) return false;
+        if (s_typeNames.TryGetValue(name, out var known)) return known;
+        var found = AppDomain.CurrentDomain.GetAssemblies()
+            .Any(a => Safe(() => a.GetType(name, throwOnError: false) is not null, false));
+        s_typeNames[name] = found;
+        return found;
+    }
 
     private static string? ClassNameOf(Control control, AutomationPeer peer)
         => NullIfEmpty(Safe(() => peer.GetClassName(), string.Empty)) ?? control.GetType().Name;
@@ -1545,7 +1958,8 @@ public record UiNode(
     bool IsEnabled,
     bool IsOffscreen,
     bool? IsHidden,
-    UiNode[] Children);
+    UiNode[] Children,
+    string? TypeNameAsName = null);
 
 /// <summary>Deep single-node inspection from <see cref="UiAutomationDriver.Inspect"/>.</summary>
 public record UiNodeDetail(
@@ -1565,7 +1979,9 @@ public record UiNodeDetail(
     string? Value,
     bool? ToggleState,
     VmMember[] DataContextMembers,
-    RangeState? Range = null);
+    RangeState? Range = null,
+    string? DataContextOwner = null,
+    string? DataContextNote = null);
 
 /// <summary>A range control's state: a scroll bar's or slider's position, its bounds, and whether it can be set.</summary>
 public record RangeState(double Value, double Minimum, double Maximum, bool IsReadOnly);
@@ -1579,4 +1995,13 @@ public record VmMember(string Name, string Kind, string? TypeName, bool CanWrite
 
 /// <summary>Outcome of <see cref="UiAutomationDriver.Interact"/>. <c>Mechanism</c> is "peer" for
 /// provider-backed actions (Phase 6) and "reflection" for the DataContext fallback (Phase 7).</summary>
-public record InteractOutcome(bool Success, string Mechanism, string? Detail, string? Error);
+/// <param name="Committed">
+/// A <c>set_value</c> pushed its text to a bound source, so whether the source kept it is still to be asked
+/// (<see cref="UiAutomationDriver.RefusedCommit"/>). Not part of the reply; the detail says it in words.
+/// </param>
+public record InteractOutcome(
+    bool Success,
+    string Mechanism,
+    string? Detail,
+    string? Error,
+    [property: System.Text.Json.Serialization.JsonIgnore] bool Committed = false);

@@ -106,7 +106,6 @@ the old `docs/TODO.md` MCP section; this consolidates it.)*
 > the desktop path is verified against the running IDE.
 
 
-
 **Symptom.** Verifying that a running form's menus render correctly, `take_snapshot` shows the menu *bar*
 but never a dropped-down menu, and `dump_visual_tree` reports every top-level `MenuItem` with
 `"children": []`. `interact` refuses both `expand` and `invoke` on a top-level `MenuItem`
@@ -157,7 +156,6 @@ half, since a popup that cannot be opened cannot be captured either.
 > gives `projectStopped: true, dialogsClosed: 0` (ending the project takes its dialog with it), and an
 > open Tools ▸ Options modal gives `projectStopped: false, dialogsClosed: 1`. `/health` stops answering
 > within a second in both cases, the process is gone, and the build that used to fail on a lock succeeds.
-
 
 
 **Symptom.** With a running VB6 program showing a `MsgBox`, `shutdown_ide` returned without error and the
@@ -1181,7 +1179,6 @@ executable statement is still accepted. Both are noted on #569.
 
 ---
 
-<<<<<<< HEAD
 ## `add_file` created a document under a name VB6 does not accept, and could write outside the project — **CLOSED** (#596, 2026-09-22)
 
 > **Fixed.** `add_file` now applies `ProjectNaming`, the rule every other way of naming a document uses:
@@ -1207,7 +1204,9 @@ each refused, and nothing is written. The reviewer found this, not the audit.
 **Why it mattered.** Nothing refused the name until something downstream tried to use it as an identifier.
 The reply said "saves it to disk" while the `.vbp` did not list the file, so a caller checking the project
 file concluded the add had failed.
-=======
+
+---
+
 ## A run that failed to start was reported as started, and left the debugger saying `Running` — **CLOSED** (#590, 2026-09-22)
 
 > **Fixed.** When the startup form cannot be built, the start now tears down what it had claimed (the
@@ -1240,7 +1239,6 @@ in the IDE log. `run_to_cursor` takes the same path. A person pressing F5 sees n
 runtime-error dialog and `get_last_runtime_error` reports it, and reset the controller to `Stopped`:
 [#590](https://github.com/hexide-io/HexIDE/issues/590). Any exception while the startup form loads
 takes this path, not only #589's.
->>>>>>> upstream/main
 
 ---
 
@@ -1276,3 +1274,614 @@ held for both the short and the long spelling of the profile, and the log line f
 **Exposure.** An exception message can carry local paths. The server already returns absolute paths and
 whole documents to any local caller, and it is DEBUG-only and loopback-only with `Host` and `Origin`
 checked. The stack trace is kept out of the reply. Authentication stays #352.
+
+---
+
+## Four tools returned an exception message with the profile path unredacted — **CLOSED** (#606, 2026-09-22)
+
+> **Fixed.** `set_file_content`, `add_file`, `set_control_property` and `add_control` catch their own write
+> failures and put the exception's message in their reply. Those messages now go through
+> `ToolFailures.WithoutProfile`, the same redaction #603's backstop applies. That redaction now also covers the
+> forward-slash spelling of the profile, as a `file:///C:/Users/…` URI carries it, in both the long and the 8.3
+> short form. It is for the report, not a security control; the server's exposure is #352.
+
+**Measured.** With the target file read-only, each of the three writing tools tried answered `Access to the
+path is denied.` with no path in it, because the writer's own message does not name one here. So the redaction
+is defensive at these four sites. It was exercised end to end on the backstop in #605, where an
+`UnauthorizedAccessException` did carry the path.
+
+---
+
+## `set_window_state` threw on a negative size, ignored `x` or `y` alone, and could put the IDE off every screen — **CLOSED** (#602, 2026-09-22)
+
+> **Fixed.** Everything is checked before anything changes, and a refusal says "Nothing was changed.":
+> - a non-positive `width` or `height` is refused;
+> - `x`, `y`, `width` or `height` with a state other than Normal is refused rather than ignored;
+> - a position that would leave the window intersecting no screen's working area is refused, and the reply
+>   names the screens.
+>
+> `x` and `y` now apply independently. A left-out coordinate keeps the window's current value, read after
+> restoring from Maximized, so it is the restored position, not the maximised frame's -11. The reply carries
+> the resulting `window` (state, position, size) as `get_window_state` reports it, read after layout, so a new
+> size is not reported as the old one.
+
+**Symptom.** On a window at (190,190) 945×447:
+- `set_window_state {"state":"Normal","width":-50,"x":-99999}` answered only `An error occurred invoking 'set_window_state'.`
+- `{"state":"Normal","x":300}` answered success and left the window where it was.
+- `{"state":"Normal","x":-99999,"y":-99999}` answered success and moved the IDE to (-32768,-32768), where nobody could see or reach it.
+
+**Found while fixing it.** Applying the geometry before `WindowState = Normal` lost it whenever the window was
+maximised: the restore put the window back at its restore bounds. Reading `ClientSize` straight after setting
+`Width` gave the size before the call.
+
+---
+
+## `press_key` named the control that received the key only by its class — **CLOSED** (#611, 2026-09-22)
+
+> **Fixed.** When the input goes somewhere other than the control addressed, `press_key` and `type_text`
+> now give the receiver's path as `dump_visual_tree` prints it, walked down from the addressed control with
+> the same segment choice, so the path can be fed straight back as a target. A TextArea that the control
+> view folds into its editor is given as its editor's path, which resolves back to the same TextArea. Live, on
+> a `--newproject` IDE with Form1's code window open:
+> `press_key {"target":"Window","key":"End"}` → `pressed End on TextArea, at Window/Custom[MainView]/…/None[TextEditor]/Pane[PART_ScrollViewer]/None`.
+> Pressing End again at that path answered `pressed End`, with no redirect.
+
+**Symptom.** `press_key {"target":"Window","key":"Return"}` answered `pressed Return on TextArea`. The IDE holds
+a TextArea for the Immediate window and one per open code editor, so the class said which kind of control got
+the key and not which one.
+
+---
+
+## `hover` quoted a declared tip from an unrelated descendant, and accepted a negative dwell — **CLOSED** (#610, 2026-09-22)
+
+> **Fixed.** The declared tip now comes from the control under the hovered point, or its nearest ancestor
+> that declares one, found by bounds so a disabled button still counts. `dwellMs` outside 0 to 10000 is
+> refused. When the pointer goes to an editor under the target, the reply gives that editor's path. Live,
+> on a `--newproject` IDE:
+> `hover {"target":"Window","dwellMs":-5}` → `dwellMs must be between 0 and 10000; it was -5`.
+> `hover {"target":"Window","dwellMs":0}` → `hovered (0, 8.5) on TextEditor[Editor], at Window/…/Pane[Immediate]/Custom; no tip opened within 0ms`, with no declared tip.
+> `hover` on `…/None[StandardToolbar]` → `declared tip: End`, the disabled button at its centre. At (5, 10) → `declared tip: Add Project`.
+
+**Symptom.** `hover {"target":"Window","dwellMs":-5}` (x, y, window left at null) answered
+`hovered (0, 25.6) on TextEditor[Editor]; no tip opened within -5ms (…); declared tip: Add Project`. The pointer
+went to a code editor. The declared tip was the Standard toolbar's, found by a search of the target's descendants.
+The negative dwell had been clamped to 0 but was reported as given.
+
+---
+
+## `set_control_property` could not set `Name` on anything — **CLOSED** (#494, 2026-09-22)
+
+> **Fixed.** A property is matched by the name the Properties window shows, without regard to case or to the
+> parentheses of `(Name)`, so `Name` reaches it. A rename passes the Properties window's rules on every route,
+> now kept in one place (`ComponentNaming`): not empty and unique on the form, and for the form itself a valid
+> VB6 name no other document of the project has. With the designer open its handler applies them and the
+> tool turns the `DataValidationException` into a refusal; with it closed the tool asks them first. Live, on a
+> `--newproject` form with `Command0` and `cmdOk`:
+> `set_control_property {"formName":"Form1","controlName":"Command0","property":"name","value":"cmdOk"}` →
+> `'Command0' was not renamed: Name must be unique in form`, with the designer open and again with it closed;
+> `Form1` → `1st` refused as not a VB6 name; `Form1` → `frmMain` renamed the document.
+>
+> **Still open, and filed separately:** `set_value` on the Properties window row's `Edit` reports success and
+> does not commit: [#625](https://github.com/hexide-io/HexIDE/issues/625), with its own entry in
+> `docs/mcp-server-gaps.md`.
+
+
+**Symptom.** `set_control_property(formName: "Form1", controlName: "Command1", property: "Name", value:
+"Command0")` answers `Property 'Name' not found on VB.CommandButton`. The same call against the form's own
+root answers `Property 'Name' not found on VB.Form`. `Name` is the first row of the Properties window and
+the one property every VB6 developer sets on every control they draw.
+
+**Measured, not inferred** (2026-09-20), while checking whether a newly added validation refusal could
+escape this tool's narrow catch (`HexIdeTools.cs` catches only `FormatException` and `OverflowException`
+inside its dispatcher lambda). It cannot, because the property is refused before anything is set — so the
+escape is unreachable through this tool, and the guard rail nobody can reach is worth recording as such.
+
+**Consequence.** Renaming a control or a document is not automatable through the property tool at all. The
+working route is the Properties window itself: `interact` with `set_property` on the `(Name)` row's
+`PropertyViewModel.Value`, which is the reflection fallback rather than a provider action, and which does
+commit through the same validation the user gets. `set_value` on that row's `Edit` writes the text and does
+**not** commit — the binding updates on focus loss and Enter does not stand in for it — so a caller who uses
+the obvious verb sees success and no rename.
+
+---
+
+## `set_value` on a Properties window row reported success and did not commit — **CLOSED** (#625, 2026-09-22)
+
+> **Fixed, for a person as well.** The row's text box commits on focus loss, and nothing handled Enter, so
+> Enter did nothing for a person either. Now:
+> - `PropertyBox` commits on Enter.
+> - `set_value` on a bound text box commits as Enter would. The `interact` tool then reads the box back
+>   after the dispatcher has run the source's reaction, so a refused value is reported as refused.
+> - The Properties window posts its revert of a refused value, which was being dropped because it was raised
+>   inside the binding's write. So the row no longer keeps showing a value the control does not have.
+>
+> Live, on a `--newproject` form:
+> - `set_value` `Hello 625` on the Caption row → `…, and committed it`, and `get_form_controls` shows the new
+>   caption.
+> - `type_text` then `press_key` Enter on the same row → committed.
+> - Height `tall` → `…, but after committing it shows '300': the change was refused or rewritten…`, with the
+>   Invalid property value box open.
+> - `(Name)` `1st` → `…shows 'Form1'…`.
+
+
+**Symptom.** `interact` with `set_value` on a Properties row's `Edit` (e.g.
+`…/Pane[Properties]/Custom/Tab[TabProperties]/List[AlphabeticProperties]/Pane[PART_ScrollViewer]/ListItem[Caption]/Edit`,
+`value` `Hello 494`) answers `set value of 'Edit' to 'Hello 494'`, and `get_form_controls` still reports the
+old caption. `press_key` Enter on the same `Edit` does not commit it either. The row's binding commits on
+focus loss, which neither causes.
+
+**Workaround.** Use `set_control_property`, which sets the property itself. Or, in the Properties window,
+use `interact` `set_property` with `Value=…` on the row, which is the reflection fallback.
+
+**Suggested fix.** Push the text box's binding to its source after `set_value`, or say in the reply that
+nothing has been committed: [#625](https://github.com/hexide-io/HexIDE/issues/625).
+
+## Claude Code cut three tool descriptions short, losing `window` "ide" among other things — **CLOSED** (#638, 2026-09-22)
+
+> **Fixed.** Every description a caller reads, a tool's and each parameter's, is now at most 2048 characters,
+> and `ToolDescriptionLengthTests` fails the build on one that is longer. Text about a single parameter moved
+> into that parameter's own `[Description]`, which the SDK sends in the input schema.
+
+**Symptom.** The `interact` schema Claude Code delivered to a session ended mid-word:
+`…a TreeViewItem's own peer offers no prov… [truncated]`. The text before the marker is 2048 characters
+exactly, counted from what was received. `list_lsp_messages` arrived cut the same way, at
+`…Abandoned (the connection wen… [truncated]`.
+
+**Measured lengths before the fix:** `list_lsp_messages` 3467, `interact` 3093, `dump_visual_tree` 2266, `hover`
+2048. The first measurement missed `list_lsp_messages`: a quick script read only a `[Description]` directly after
+`[McpServerTool]`, and that tool has three `[DescribesEnum]` attributes between them. The guard found it, since it
+reads through the same parser as every other description check.
+
+**What a caller lost.** From `interact` and `dump_visual_tree`, the only mention of passing `window` "ide" to reach
+the IDE while a program runs or is paused, when the frontmost window is the program's form. From `interact` also
+the dropdown advice and "use dump_visual_tree/inspect_element first". From `list_lsp_messages`, the end of the
+`outcome` vocabulary, the sequence-gap explanation, the reply-on-the-request's-row rule, and the filters.
+
+**Not verified in the session that fixed it.** A session caches tool schemas when it attaches, so the new text
+could not be read back through the client that cut the old one. The text itself is guarded; that the client
+delivers it whole needs a session attached after the change (`/mcp`, reconnect `hexide`).
+
+**2048 is one client's limit, and the tightest known.** Other clients may cut elsewhere, which argues for keeping
+a tool's description to what the tool does rather than for raising the limit.
+
+## Every parameter of a capture tool was required, including the ones that mean "no filter" — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #393 (#369 phase 3), which gave every optional parameter a C# default.**
+
+**Symptom.** The first call to `list_lsp_messages` had to pass five arguments to ask the simplest possible
+question. `connectionId`, `method`, `failuresOnly`, `afterSequence` and `limit` were all in the schema's
+`required` array, so "list everything" could not be expressed as an empty call.
+
+**Cause, and it is a C# detail with a schema consequence.** A nullable parameter with no default value is
+still a *required* parameter to the MCP schema generator. `string? connectionId` is optional-looking in C#
+and mandatory on the wire. `dump_visual_tree` got this right by accident of having defaults
+(`string? root = null, int maxDepth = 20`), and the new tools did not.
+
+**Workaround used.** Pass `null` explicitly for each. It works, and it is five arguments of noise on every
+call, which is exactly the friction that makes an agent reach for a different tool.
+
+**Fixed** by giving every optional parameter a C# default. Worth knowing for the next tool: check the
+generated schema's `required` array, not the C# signature — they disagree, and only one of them is what an
+agent sees.
+
+## The capture state went blank after a clear, which is the one thing it existed to prevent — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #393 (#369 phase 3).**
+
+**Symptom.** `clear_lsp_capture` replied:
+
+```
+{"envelopesDiscarded":13,"state":{"armsEveryConnection":true,"connections":[]}}
+```
+
+The connection was alive and armed. `arm_lsp_capture` a moment earlier had listed it correctly.
+
+**Cause.** Both mutating tools returned a state whose connection list was derived from the envelopes
+present in the record — the same answer as the real list right up until somebody empties the record.
+
+**Consequence, and why it is worse than a cosmetic wrong field.** The state is returned by those two tools
+specifically so that arming is not invisible: a tool answering only "done" would leave an agent unable to
+tell an armed connection from one whose id it had misspelled. After a clear it answered exactly that.
+An agent clearing `hexide.vb6` and one clearing `hexide.vb` got identical replies.
+
+**Fixed** by having the log name its own connections (`ConversationLog.ConnectionIds`) rather than
+inferring them from traffic, which also makes a connection armed before it has started visible — the case
+the launch flag depends on. Two tests pin it.
+
+**Found on the first real use of the tools**, by driving them rather than by reading them. Both defects had
+passing unit tests around them; neither could have been caught by one, because both are about what the
+*schema* and the *reply* look like to a caller.
+
+## There is no way to ask what is being recorded without changing it — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #393 (#369 phase 3), which added `get_lsp_capture_state`.**
+
+**Symptom.** To find out which connections existed and which were armed, the only tools were
+`arm_lsp_capture` and `clear_lsp_capture` — both of which mutate. Reading the state meant arming something
+first.
+
+**Workaround used.** Call `arm_lsp_capture` with the state it already had, and read the reply.
+
+**Fixed** by adding `get_lsp_capture_state`, which is the same reply with nothing changed.
+
+## An export cannot be reached from automation — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #398 (#395), which added `export_lsp_conversation` over `ConversationExporter`, always pseudonymised.**
+
+**Symptom.** `get_lsp_message` returns a body raw, deliberately — it is the developer's own machine and
+the live view is not redacted either. But there is no tool that produces the redacted, shareable form, so
+an agent asked to attach a conversation to an issue has no safe path: it can read bodies it must not paste,
+and cannot produce the form it should paste instead.
+
+**Workaround used.** None needed yet; noted before it is.
+
+**Suggested fix.** A tool over `ConversationExporter`, which already produces the JSON-lines form plus a
+manifest and takes a redactor. It is listed as phase-four work in #369 (task 4.5, export and copy), so this
+is a note that the automation half of it matters as much as the button — an agent is the likeliest thing to
+be asked for an export, and it is currently the only consumer that cannot make one.
+
+**Filed as [#395](https://github.com/hexide-io/HexIDE/issues/395) and closed by
+`export_lsp_conversation`.** An entry here is a note to self; the surface ships either way, so an
+ergonomics defect gets an issue exactly as a human-facing one does.
+
+**The tool always pseudonymises, and the opt-out is deliberately NOT a parameter on it.** The design
+records that a non-pseudonymising mode should exist and that its surface is an open question needing a
+prominent warning wherever it lands. A boolean here would have settled that question quietly, in the one
+place with nowhere to put a warning. The raw form stays reachable through `get_lsp_message`, so nothing is
+inaccessible — only unshareable, which is the distinction the redaction boundary is made of.
+
+Its first real run found a leak no test had: a workspace folder's `name` survives while its `uri` is
+redacted, because body redaction is textual by design and a `"name"` beside a URI cannot be recognised
+that way — [#397](https://github.com/hexide-io/HexIDE/issues/397).
+
+## get_document_tabs reported three fewer tabs than the user could see — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #402 (#369 phases 4 and 5).**
+
+**Symptom.** A newly built Protocol Inspector tab was visibly open in the tab strip, and:
+
+```
+get_document_tabs      -> only the form designer
+activate_document_tab  -> "No document tab with title 'Protocol Inspector'"
+```
+
+The Object Browser and the language-server connection list were missing too. Three real tabs, in the same
+strip, invisible to automation.
+
+**Cause.** Both tools read `IDocumentDockService.OpenDocuments`, which is typed
+`IReadOnlyList<BaseEditorWindowViewModel>` and tracks only the editors the service was asked to open. The
+Object Browser, the connection list and the inspector are documents the shell adds straight to the dock, so
+they were never in that list. Nothing was wrong with the tools' logic; they were answering a narrower
+question than the one asked, and the difference was invisible from outside.
+
+**How it bit.** It blocked verification of the very feature being built. Worse, the failure was
+*affirmative*: not "I cannot see that kind of tab" but "no document tab with title X", which reads as the
+tab not existing. I had to take a screenshot to establish that the thing I had just built was on screen.
+
+**Fixed.** `IDocumentDockService` gained `AllTabs`, `ActiveTab`, `TryActivateAny` and `TryCloseAny`, reading
+the dock's own `VisibleDockables`. The three tools now answer about the strip the user sees, `type` gained
+a third value `tool` for documents that are not editors, and the description enumerates all three.
+
+**And the error now names what IS open.** A bare "no tab called X" cannot be told from a typo, and cost a
+second call to find out. The tabs were already in hand:
+
+```
+No document tab with title 'Protocl Inspector'. Open tabs: Object Browser,
+Language & Debug Servers, Project1 - Form1 (Form), Protocol Inspector.
+```
+
+## A DataGrid row could be read but not selected, which makes a master-detail window undrivable — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #402 (#369 phases 4 and 5).**
+
+**Symptom.** With the protocol inspector's grid on screen and its rows enumerated by
+`dump_visual_tree`:
+
+```
+interact(".../DataGrid/DataItem[#2]", "select")
+-> {"success": false, "mechanism": "peer", "error": "element does not support 'select'"}
+```
+
+`inspect_element` on the same row reported `"providers": []` and `"selectionItems": []`.
+
+**Cause.** A `DataGridRow`'s automation peer exposes no `ISelectionItemProvider`, and `DoSelect` refused
+when there was no provider. There was no second route either: the reflection actions set a view-model
+property by name and coerce the value from a string, and the property that holds a selection is a row
+object no string can name. So the grid was fully readable and completely inert.
+
+**How it bit.** Selecting a row is not a detail of this window, it is the window: click a row, read the
+body that crossed the wire. Every master-detail surface in the IDE has the same shape, so the gap was one
+control wide and the whole pattern deep. It surfaced while verifying the detail pane, which could not be
+verified at all until it was fixed.
+
+**Fixed.** `UiAutomationDriver.DoSelect` falls back to selecting through the grid that owns the row —
+found by walking up the visual tree, because `DataGridRow.OwningGrid` is internal — and reads
+`SelectedItem` back rather than assuming the grid accepted it. `DescribeProviders` now advertises
+`selectionItem` on a row, so the verb is discoverable instead of being a thing a caller has to try.
+Covered headlessly in `UiAutomationDriverTests`.
+
+## A native file dialog cannot be driven, so every flow that ends in one needed a person — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #402 (#369 phases 4 and 5), which added `answer_next_file_dialog`.**
+
+**Symptom.** The protocol inspector's new *Export conversation…* button opens a save picker.
+`dump_visual_tree` sees nothing of it — a native Win32 dialog is not in Avalonia's control tree at all —
+and while a modal one is up the server does not answer. So the button could be found, enabled and invoked,
+and what happened next could not be observed or completed.
+
+**How far it reaches.** Not one button. Save As, Open Project, Add File, Make EXE, Make Project Group,
+every export: each of them ends in `IStorageProvider`, and each has been verified up to the dialog and by
+hand after it. This was already noted in passing inside a *closed* entry about carried files, which is
+where a general gap goes to be forgotten.
+
+**Fixed, and deliberately not by faking the dialog.** `answer_next_file_dialog(path?)` arms the answer the
+picker would have returned; `clear_file_dialog_answers` discards what is armed. `WindowManager` consults
+the armed answer before reaching for the storage provider, so everything below the picker — the writing,
+the naming, the refusals — is the same code a real click reaches. Only the part a person performs is
+skipped.
+
+Three properties are load-bearing:
+
+- **Single-shot.** A standing override would silently redirect the next unrelated save, and that damage
+  shows up somewhere other than where it was caused.
+- **Cancellation is expressible.** An empty path answers as cancelled, which is a distinct branch through
+  most of these flows and the one least likely to have been exercised by hand.
+- **DEBUG only.** The queue and both call sites compile out with the server, so a shipped build has no
+  bypass rather than an unreachable one.
+
+**It did NOT need a session restart, and that is worth recording because the expectation was wrong.** Two
+brand-new tool schemas appeared to the already-attached client as soon as the IDE relaunched carrying them,
+and were callable in the same session that added them. That matches the measured entry above about
+mid-session relaunch rather than the standing advice, which is written for the case where the server was
+not attached when the session began. Verified by using both tools to drive the export they were built for,
+including the cancellation branch.
+
+## `get_lsp_message` could not return a single response, and nothing said so — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #431 (#429).**
+
+**Symptom.** Pointing HexIDE at a foreign server and trying to read what it advertised. `list_lsp_messages`
+showed the `initialize` request answered in 41 ms; `get_lsp_message` on that sequence returned the
+**request**. There was no sequence that returned the reply, no field naming one, and no explanation — the
+tool had exactly one address per exchange and it was the half already known.
+
+**How it bit.** The whole investigation was about an `InitializeResult`: which capabilities the server
+declared, and therefore which later messages were legal. Getting it meant writing a client outside the IDE
+and driving the server over its own transport by hand — reintroducing, inside the tool built to destroy
+the ambiguity, the exact work that tool exists to remove. Two other things went with it: an unarmed
+connection could say a request was answered and not how large the answer was, and
+`export_lsp_conversation` — a format whose claim is that it replays into a client — contained not one
+reply, so the requests in it would hang.
+
+**Why it survived.** `ConversationLog.TryComplete` pairs a response with its request, stamps the outcome
+and the latency onto that request's envelope, and returned. Its comment explains half the decision
+correctly and stops one step short: *"The response is not itself an entry. It is the second half of one,
+and a timeline that showed both would double every request."* True about the **entry**, and taken as
+license to drop the **body**. Everything downstream then read as working: the timeline was right, the
+latencies were right, and the one thing missing was missing uniformly, so it looked like a design rather
+than a hole. A caller who has never seen the record cannot tell "responses are not kept" from "this
+response was not kept" from "I have asked the wrong question", which is the three-way ambiguity this
+surface exists to destroy.
+
+**Fixed** (hexide-io/HexIDE#429). A response keeps the sequence it was already allocated — responses have
+always consumed one, which is why a listing has always had gaps and why this tool's description has always
+had to explain that those gaps are not dropped frames. The request's row now names it, so the apology
+becomes an address: `answerSequence` when a body was kept, and `answerSizeBytes` always, since a size is
+metadata and belongs to the tier that runs unarmed. Passing an answer sequence to `get_lsp_message` returns
+`isAnswer`, `answerTo`, and the request's method, because a response carries none on the wire. Both tool
+descriptions say all of this, including which state a row with an outcome and no `answerSequence` is in.
+
+**The general lesson is the one this file keeps re-learning.** The author knew responses completed their
+requests; a first-time caller sees a sequence number that answers with the wrong half. Judge the tool by
+what a model that has never seen it would do on first contact — and a reply that is structurally
+unreachable must at minimum say so, rather than returning something plausible and adjacent.
+
+## A mark tool answered about the startup project, keyed on the caller's spelling, and said nothing back — **CLOSED** (moved from the live file 2026-09-22)
+
+> **Closed by #495 (#273 phase 1).**
+
+**Symptom.** `set_breakpoints("form1", [5])` on a project holding `Form1` replied `{"success":true}`. The
+gutter showed nothing, the run broke nowhere, and `get_breakpoints("Form1")` answered with an empty array.
+Two tools, two confident replies, no breakpoint. With a project group open, the four mark tools could not
+reach the second project's documents at all — a name they did not recognise was `No form or module named
+'X' found`, whether or not the IDE had one open in front of the caller.
+
+**How it bit.** `ResolveDocumentUri` matched a name case-insensitively against the **startup** project and
+then built the store key by interpolating the **caller's** spelling into `vb6://form/{name}`
+(hexide-io/HexIDE#467). Both mark stores were ordinal dictionaries, so `vb6://form/form1` was a second
+entry beside `vb6://form/Form1` — one the gutter, the runner and the sidecar all read past. The reply then
+echoed that key back in its `uri` field, which reads as confirmation rather than as the symptom it was.
+
+**Why it survived.** Three separate things each looked correct. The match was case-insensitive, which is
+what VB6 does. The key was minted the same way the editor mints it, which is what consistency looks like.
+And the reply named what had been written, which is what a mutating tool should do. What nobody wrote down
+is that the two had to be the *same* string, and nothing in the surface could show they were not: a caller
+who has never seen the IDE cannot tell "set, and shown" from "set under a name nothing reads" when both
+answer `success`.
+
+**Fixed** (#273 phase 1). A name resolves to a *document* before anything is keyed, and the stores are
+keyed by that document rather than by any spelling of its name. Every tool that names a document searches
+**every loaded project**, takes an optional `project` to disambiguate, and refuses an ambiguous bare name
+with the candidates listed rather than picking one. Replies carry `project` and `document` — the IDE's own
+spelling, not the caller's — beside the wire `uri`, and a mutating reply now reports what the document
+holds afterwards, including when that is nothing: `Form1 now has no breakpoints.` rather than a bare
+success.
+
+**Two descriptions were corrected rather than fixed.** `clear_all_breakpoints` said "Removes every
+breakpoint in the project"; it removes every breakpoint in *every loaded project*, and has always done so.
+Whether VB6 agrees is unmeasured and is filed as #492. And `set_bookmarks(name, [])` promised to clear a
+document's bookmarks: it emptied the store and raised no change event, so the gutter kept its dots and the
+sidecar was never rewritten — the cleared bookmarks came back on the next load. That one was a real defect
+and is fixed with the rest.
+
+**The lesson this adds.** A reply that echoes an argument back is not evidence the argument was understood.
+Where a tool normalises what it was given — a name matched without regard to case is exactly that — the
+reply must carry the **normalised** form, because the difference between the two is the whole of what the
+caller cannot otherwise see.
+
+## 2. `set_control_property` only handles string / number / bool — **CLOSED** (#641, 2026-09-22)
+
+> **Fixed.** `set_control_property` reads its value through `PropertyText`, which defers to the Properties
+> window's own parser and adds an enum by number, by name or as the dropdown shows it (`1 - Opaque`), with
+> numbers read in the invariant culture. A refusal lists what the property takes. Verified live:
+> `BackStyle` `"0 - Transparent"` and `BackColor` `"&H00C0FFC0&"` were written to the `.frm` as
+> `BackStyle = 0 'Transparent` and `BackColor = &H00C0FFC0&`; `"7"` and `"green"` were refused naming the
+> accepted spellings.
+
+**Symptom.** Setting an **enum** property fails — `set_control_property(Label0, "BackStyle", "1")` →
+*"Property 'BackStyle' has type 'BackStyles' which is not supported by set_control_property"*. **Colour**
+(`VBColor`) properties (`BackColor`/`ForeColor`) are likewise unsettable.
+
+**How it bit.** I couldn't make a label opaque, nor set a control's colour, via the designer tool — so the
+Phase-2 colour verification had to be done by *running code* (`Me.BackColor = &HC0FFC0` in `Form_Load`) and
+snapshotting the result, rather than a designer property set.
+
+**Fix.** Accept enum values (by member name or ordinal) and `VBColor` values (a hex `OLE_COLOR` string like
+`"&H00FF0000&"`, or an `R,G,B` triple). Better: route the incoming string through the **same property-editor
+coercion the designer's property grid uses**, so every editable property type is settable through one path.
+
+## take_snapshot renders DIPs while Win32 coordinates are physical pixels — **CLOSED** (#646, 2026-09-22)
+
+> **Fixed.** `take_snapshot` now reports the image's `width` and `height` in pixels and its `scale`, the pixels
+> per device-independent unit, and `inspect_element` says `boundingRect` is in the window's device-independent
+> units from its top-left, which is the image's top-left. **One detail below was wrong when re-measured:** on a
+> 150% display `boundingRect` was in DIPs, not in the image's pixel space. The Start button's `[270, 26, 22, 22]`
+> is at `[405, 39, 33, 33]` in the 1500 × 900 snapshot, and a crop of that region is the button. The entry is kept
+> as it was written; its Win32 half (`GetClientRect` in physical pixels) was not re-measured.
+
+**Symptom.** Driving a synthetic mouse click from a `boundingRect` needs a scale conversion that nothing in
+the tool output mentions. On the machine this was hit on, `GetClientRect` reported 987 × 560 physical pixels
+while `take_snapshot` returned a 1481 × 840 image and `inspect_element` reported bounds in that same 1481-wide
+space — a factor of 0.666. Clicking at the raw `boundingRect` coordinates lands roughly 50% off, far enough
+to hit a different control and look like "the click did nothing".
+
+**Consequence.** Any fallback that leaves the MCP surface for real input — the only route left when a
+control has no usable provider — silently targets the wrong place, and the resulting no-op is easy to
+misread as the feature being broken.
+
+**Workaround.** Derive the factor before clicking: `GetClientRect` width ÷ snapshot image width, then
+multiply the DIP coordinate by it and pass through `ClientToScreen`. Do not assume 1.0, and do not assume
+the usual Windows 1.25/1.5 either — measure it.
+
+**Suggested fix.** Report the scale explicitly. `take_snapshot` returning the render scale alongside the
+path (and `inspect_element` naming the space its `boundingRect` is in) would remove the guesswork; the
+values are already known to the server.
+
+## 8. `type_text` bypasses a read-only editor, and reports `mechanism: "keyboard"` while doing it — **CLOSED** (#649, 2026-09-22)
+
+> **Fixed.** `type_text` refuses a read-only or disabled surface, naming which, and reports its mechanism as
+> `"document"`; `"keyboard"` is left to `press_key`. Verified live on a form HexIDE opens read-only (a
+> `CommandButton` nested in a `ListBox`): `type_text` answered `TextEditor is read-only, so a person could not
+> type there either; nothing was inserted`, and `get_file_content` showed the code unchanged. Worth knowing
+> when re-testing: the code window is read-only for a form HexIDE cannot save faithfully, not while a program
+> runs, so a running program is not the way to reach this.
+
+**Symptom.** Verifying the read-only editing gate (#22) against the running IDE, `type_text` successfully
+inserted `XXX_SHOULD_NOT_APPEAR` into a code editor whose `TextEditor.IsReadOnly` was bound true. The result
+reported `"mechanism":"keyboard"`, which reads as "a real key event went in" — so the first conclusion was
+that the gate was broken. It was not.
+
+**Cause.** The tool's own description says it inserts "at the caret **via the control's own API**", which is
+a document mutation, not input. `IsReadOnly` on AvaloniaEdit guards the *editing UI*, so a direct
+`Document.Insert` legitimately sidesteps it. The `mechanism: "keyboard"` label is the misleading part.
+
+**Workaround.** Do not use `type_text` to test whether input is blocked. `press_key` raises real
+`KeyDown`/`KeyUp`, but note gap #9 below before trusting a negative result from it either. The reliable
+check is behavioural at a level the user cares about — here, invoking Save and confirming the file on disk
+is byte-identical afterwards.
+
+**Suggested fix.** Report `mechanism: "api"` (or `"document"`) when inserting programmatically, and reserve
+`"keyboard"` for genuine key events. Optionally have `type_text` refuse, or warn, when the target editor is
+read-only — silently mutating a read-only document is a surprising default for an automation tool.
+
+## `get_diagnostics` answered `[]` for clean code, for no server running and for an analysis not yet back — **CLOSED** (#664, 2026-09-22)
+
+> **Fixed.** The reply now carries `analysed`, the documents whose diagnostics are in, clean ones
+> included. It also carries a `note` saying which case an empty or partial answer is: no language server
+> started; a document opened or edited whose analysis has not come back; or every analysed document clean.
+> An edit is tracked by the document's own session (`LspDocumentSession.AwaitingDiagnostics`), so a stale
+> "clean" for text the caller has just changed is reported as pending, not as an answer. Found and fixed in
+> the same pass, so this entry never sat in the live file.
+
+**Symptom.** `set_file_content` then `get_diagnostics`, the obvious way to check an edit, answered
+`{"diagnostics":[]}` for code with a syntax error in it. Measured with `get_diagnostics` on `--newproject`:
+`[]` with no server started (`get_lsp_capture_state` → `connections: []`); `[]` after `set_file_content`,
+because nothing was open and only open documents are analysed; `[]` for about 3 s after `open_file`, while
+the server started (`initialize` alone took 1.7 s); and, found while checking the fix, `[]` for about a
+second after an edit to an open document, when the diagnostics held were for the text before it.
+
+**Also.** `DiagnosticsCache` keyed documents by raw URI string, where `AddinDiagnosticsService` had moved
+to `LspDocumentUri.Comparer`; it now uses the comparer too.
+
+## `open_file` does not give the editor keyboard focus, so a routed menu item refuses until something does — **CLOSED** (#678, 2026-09-22)
+
+> **Fixed.** `open_file`, `view_designer` and `activate_document_tab` now put keyboard focus in the document
+> they bring to the front (an editor's text area, or the designer's form surface), as opening it by hand does, and
+> say so in their note. Verified live: `open_file {"name":"Form1"}` then `invoke_menu_item {"path":"Tools/Add Procedure"}`
+> opened the dialog with no `press_key`, and focus followed `activate_document_tab` between the designer and the
+> code window. The entry is otherwise as it was.
+
+**Symptom.** Most built-in menu items are routed commands, which act on the control that has keyboard
+focus. `open_file` brings a code window to the front but leaves focus where it was (measured: nowhere), so
+`invoke_menu_item {"path":"Tools/Add Procedure"}` straight after `open_file {"name":"Form1"}` is refused.
+After `press_key {"target":".../Custom[Root]/None[TextEditor]","key":"Right"}` the same call opens the Add
+Procedure dialog. A person who opens a code window has focus in it, so the tool is behind the person here.
+
+**Narrowed by #678's PR.** The refusal used to say only `canExecute returned false`. It now says the item is a
+routed command, names what has focus, and says `press_key` on the editor is the way in. What remains is the
+focus itself.
+
+**Workaround.** `press_key` on the editor with a key that changes nothing (`Right`) before invoking an item
+that belongs to a document.
+
+**Suggested fix.** Have `open_file` and `activate_document_tab` give the opened document keyboard focus, as
+opening it by hand does: [#678](https://github.com/hexide-io/HexIDE/issues/678).
+
+## 5. A designer control is reported under its view-model's type name, not its own — **CLOSED** (#543 for #526, #663 for #661; moved from the live file 2026-09-22)
+
+> **Closed.** What remained after the 2026-09-22 narrowing was the node name, and #543 fixed it for #526: a canvas
+> control is now `ListItem[Command0]`, measured again the same day with `dump_visual_tree(root: ".../List[ControlsContainer]")`.
+> The multi-selection addendum was closed by #663 (#661). The entry is otherwise as it was.
+
+**Was:** *Can't select / delete / reorder a designer control via MCP.* Measured again for #362, and most of
+it no longer holds. With default arguments, `dump_visual_tree(root: ".../Pane[#0]")` lists each canvas
+control as a `ListItem` (`ControlItem`) with `selectionItem`. `interact select` on it selected it,
+`press_key(key: "Delete")` on it deleted it (`get_form_controls` confirmed `Command0` gone; the Edit menu
+then offered *Undo Delete: Command0*), and `invoke_designer_undo` / `invoke_designer_redo` both exist. The
+`FormEditor.BringToFront` / `SendToBack` toolbar buttons are addressable by `automationId`; reordering was
+not driven in this pass.
+
+**What remains.** The node's name is `HexIDE.VisualDesigner.ComponentInstanceViewModel`, the view model's
+`ToString()`, so the path is `ListItem[HexIDE.VisualDesigner.ComponentInstanceViewModel]` for every
+control. With more than one control on a form, a caller cannot tell from the tree which node is
+`Command1`; it has to fall back on position or index. Filed as #526. The rest of this entry is the original record.
+
+**Multi-selection (#661, closed by the PR that adds this note).** `interact select` replaces a selection, so
+a caller could hold one control, or all of them through `press_key(key: "A", modifiers: "Ctrl")`, and nothing
+in between. `interact add_to_selection` / `remove_from_selection` now reach a chosen group, and each canvas
+control reports the `multiSelectItem` token that promises them. Measured with three buttons:
+`select` Command0, then `add_to_selection` Command2 → `added 'Command2' to the selection; 2 items are selected
+now: Command0, Command2`; `invoke_format_command(command: "AlignLefts")` then moved Command2 to Command0's
+Left (120) and left Command1 at 600.
+
+
+**Symptom.** A control placed with `add_control` is created and auto-selected, but there is no way to (a) select a
+*different, existing* control, (b) delete a control, or (c) exercise undo/redo of a designer edit through MCP. The
+controls drawn on the designer canvas are **not individual nodes in `dump_visual_tree`** (the canvas paints them; the
+tree shows only the Properties-pane `ObjectSelector` combo and dock chrome), so `interact`/`press_key` have no path
+to target a specific control, and there is no `select_control` / `delete_control` tool.
+
+**How it bit (bug-hunt batch-2 designer fixes).** Verifying the four `FormEditViewModel` fixes — duplicate-name
+avoidance (needs *delete then re-add*), multi-select **Delete** (needs a multi-selection), and undo **z-order**
+restore (needs cut + undo) — was not drivable. Only the no-collision naming path was confirmed live (`add_control`
+twice → `Command0`, `Command1`). The rest were verified by build + code review against the already-proven
+`CutSelectedControls` path and the standard ascending-index restore invariant.
+
+**Root cause.** The designer canvas is a custom-drawn surface; component VMs aren't surfaced as automation nodes, and
+the designer's selection/delete/undo aren't exposed as `ICommand`s reachable via `interact invoke_command`.
+
+**Fix consideration.** Small, high-leverage additions: `select_control(formName, controlName)` (drive the designer's
+`SelectedComponent`/`SetSelectedComponents`), `delete_selected_controls`, and `designer_redo` to pair with the
+existing `invoke_designer_undo` — plus surfacing each canvas control as a `dump_visual_tree` node with its name, so
+`interact` can click/rubber-band it. That would make the whole designer edit loop (add → select → move → delete →
+undo/redo) MCP-verifiable.
